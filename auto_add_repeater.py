@@ -24,7 +24,27 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
         self.config = {
             'require_parameters': True,
             'ignored_parameters': ['__VIEWSTATE', 'token', 'csrf', '__RequestVerificationToken',
-                                   'authenticity_token', '_csrf', 'nonce', 'timestamp']
+                                   'authenticity_token', '_csrf', 'nonce', 'timestamp'],
+            'ignored_extensions': [
+                # Images
+                '.jpg', '.jpeg', '.png', '.gif', '.ico', '.svg', '.webp', '.bmp', '.tiff',
+                # Scripts
+                '.js', '.jsx', '.ts', '.tsx', '.mjs', '.coffee',
+                # Styles
+                '.css', '.scss', '.sass', '.less',
+                # Fonts
+                '.ttf', '.otf', '.woff', '.woff2', '.eot',
+                # Documents
+                '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx',
+                # Archives
+                '.zip', '.rar', '.tar', '.gz', '.7z',
+                # Media
+                '.mp3', '.mp4', '.avi', '.mov', '.wmv', '.flv', '.wav',
+                # Web
+                '.html', '.htm', '.xml', '.json', '.map',
+                # Other
+                '.txt', '.log', '.swf', '.yaml', '.yml'
+            ]
         }
 
         self.storage_file = self.get_storage_file_path()
@@ -40,10 +60,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
         self._stdout.println("[+] Loaded %d previously processed requests" % len(self._processed_requests))
 
     def log(self, message):
+        """Helper method for consistent logging"""
         self._stdout.println("[*] %s" % message)
 
     def log_error(self, message):
-        self.log(message)
         """Helper method for error logging"""
         self._stdout.println("[!] ERROR: %s" % message)
         traceback.print_exc(file=self._stdout)
@@ -53,10 +73,12 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
             self.panel = JPanel()
             self.panel.setLayout(BoxLayout(self.panel, BoxLayout.Y_AXIS))
 
+            # Parameters checkbox
             self.require_params_checkbox = JCheckBox("Only process requests with parameters",
                                                      self.config['require_parameters'])
             self.require_params_checkbox.addActionListener(lambda x: self.updateConfig())
 
+            # Ignored parameters input
             params_panel = JPanel(FlowLayout(FlowLayout.LEFT))
             params_panel.add(JLabel("Ignored parameters (comma-separated):"))
             self.ignored_params_field = JTextField(
@@ -66,6 +88,17 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
             self.ignored_params_field.addActionListener(lambda x: self.updateConfig())
             params_panel.add(self.ignored_params_field)
 
+            # Ignored extensions input
+            extensions_panel = JPanel(FlowLayout(FlowLayout.LEFT))
+            extensions_panel.add(JLabel("Ignored extensions (comma-separated):"))
+            self.ignored_extensions_field = JTextField(
+                ','.join(self.config['ignored_extensions']),
+                30
+            )
+            self.ignored_extensions_field.addActionListener(lambda x: self.updateConfig())
+            extensions_panel.add(self.ignored_extensions_field)
+
+            # Buttons
             button_panel = JPanel(FlowLayout(FlowLayout.LEFT))
             process_history_button = JButton("Process Existing History",
                                              actionPerformed=lambda x: self.processExistingHistory())
@@ -76,6 +109,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
 
             self.panel.add(self.require_params_checkbox)
             self.panel.add(params_panel)
+            self.panel.add(extensions_panel)
             self.panel.add(button_panel)
 
             self._callbacks.customizeUiComponent(self.panel)
@@ -97,6 +131,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
             self.config['ignored_parameters'] = [
                 p.strip() for p in self.ignored_params_field.getText().split(',')
                 if p.strip()
+            ]
+            self.config['ignored_extensions'] = [
+                e.strip().lower() for e in self.ignored_extensions_field.getText().split(',')
+                if e.strip()
             ]
             self.save_config()
             self.log("Configuration updated")
@@ -179,7 +217,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
                 service.getPort()
             )
 
-            analyzed_request = self._helpers.analyzeRequest(messageInfo.getHttpService(), request)
+            analyzed_request = self._helpers.analyzeRequest(service, request)
 
             identifier += "%s:%s" % (
                 analyzed_request.getMethod(),
@@ -218,7 +256,7 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
             # max length
             tab_name = tab_name[:15]
 
-            #self.log("Created tab name: %s" % tab_name)
+            self.log("Created tab name: %s" % tab_name)
             return tab_name
         except Exception as e:
             self.log_error("Error creating tab name: %s" % str(e))
@@ -240,21 +278,48 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
             self.log_error("Error checking parameters: %s" % str(e))
             return False
 
+    def should_process_request(self, messageInfo):
+        try:
+            service = messageInfo.getHttpService()
+            request = messageInfo.getRequest()
+            analyzed_request = self._helpers.analyzeRequest(service, request)
+            url = analyzed_request.getUrl()
+
+            if not self._callbacks.isInScope(url):
+                #self.log("Request not in scope, skipping: %s" % url.toString())
+                return False
+
+            # Check file extension
+            path = url.getPath().lower()
+            for ext in self.config['ignored_extensions']:
+                if path.endswith(ext):
+                    #self.log("Skipping file with ignored extension: %s" % path)
+                    return False
+
+            if self.config['require_parameters']:
+                if not self.has_valid_parameters(messageInfo):
+                    #self.log("Request has no valid parameters, skipping: %s" % url.toString())
+                    return False
+
+            return True
+
+        except Exception as e:
+            self.log_error("Error in should_process_request: %s" % str(e))
+            return False
+
     def processHttpMessage(self, toolFlag, messageIsRequest, messageInfo):
         try:
             if not messageIsRequest:
                 return
 
-            if not self._callbacks.isInScope(self._helpers.analyzeRequest(messageInfo).getUrl()):
-                #self.log("Request not in scope, skipping: " + messageInfo.getUrl().toString())
-                return
-
-            if self.config['require_parameters'] and not self.has_valid_parameters(messageInfo):
-                #self.log("Request has no valid parameters, skipping")
+            if not self.should_process_request(messageInfo):
                 return
 
             request_identifier = self.create_request_identifier(messageInfo)
-            #self.log("Processing request: %s" % request_identifier)
+            if request_identifier is None:
+                self.log("Could not create identifier for request, skipping")
+                return
+
             if request_identifier in self._processed_requests:
                 #self.log("Request already processed, skipping")
                 return
@@ -291,15 +356,10 @@ class BurpExtender(IBurpExtender, IHttpListener, IProxyListener, ITab):
 
             processed_count = 0
             for messageInfo in proxy_history:
-                try:
-
-                    self.processHttpMessage(self._callbacks.TOOL_PROXY, True, messageInfo)
-                    processed_count += 1
-                    if processed_count % 100 == 0:
-                        self.log("Processed %d requests..." % processed_count)
-                except:
-                    self.log("Error processing history item: %s" % messageInfo.getUrl().toString())
-                    self.log(traceback.format_exc())
+                self.processHttpMessage(self._callbacks.TOOL_PROXY, True, messageInfo)
+                processed_count += 1
+                if processed_count % 100 == 0:
+                    self.log("Processed %d requests..." % processed_count)
 
             self.log("Finished processing existing history. Processed %d requests total." % processed_count)
         except Exception as e:
